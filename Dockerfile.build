@@ -5,25 +5,43 @@ ARG TARGETARCH
 ARG TARGETOS
 ARG RELEASE=RELEASE
 
+# Set secure defaults
+ENV CGO_ENABLED=0 \
+    GOOS=${TARGETOS:-linux} \
+    GOARCH=${TARGETARCH:-amd64}
+
 WORKDIR /workspace
 
-# Install build dependencies
-RUN apk add --no-cache git make bash
+# Install only necessary build dependencies
+# Combine into single RUN to reduce layers
+RUN apk add --no-cache \
+    git \
+    make \
+    bash \
+    ca-certificates \
+    && update-ca-certificates
 
-# Copy go mod files first for better caching
+# Copy go mod files first for better layer caching
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download && \
+    go mod verify
 
 # Copy source code
 COPY . .
 
-# Build MinIO binary
-RUN MINIO_RELEASE=${RELEASE} \
+# Build MinIO binary with security flags
+# Use build cache mount for faster rebuilds
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    MINIO_RELEASE=${RELEASE} \
     LDFLAGS="$(go run buildscripts/gen-ldflags.go)" && \
-    CGO_ENABLED=0 \
-    GOOS=${TARGETOS} \
-    GOARCH=${TARGETARCH} \
-    go build -tags kqueue -trimpath --ldflags "${LDFLAGS}" -o /workspace/minio
+    go build \
+    -tags kqueue \
+    -trimpath \
+    -ldflags "${LDFLAGS} -w -s" \
+    -o /workspace/minio \
+    && chmod +x /workspace/minio
 
 # Runtime stage
 FROM registry.access.redhat.com/ubi9/ubi-micro:latest
@@ -46,8 +64,14 @@ ENV MINIO_ACCESS_KEY_FILE=access_key \
     MINIO_UPDATE_MINISIGN_PUBKEY="RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav" \
     MINIO_CONFIG_ENV_FILE=config.env
 
-# Create necessary directories
-RUN mkdir -p /usr/bin /licenses /data
+# Create minio user and group with static UID/GID (best practice: UID > 10000)
+# Note: ubi-micro is minimal and may not have useradd, so we use echo to /etc/passwd
+RUN echo "minio:x:10001:10001:minio:/home/minio:/sbin/nologin" >> /etc/passwd && \
+    echo "minio:x:10001:" >> /etc/group
+
+# Create necessary directories with proper permissions
+RUN mkdir -p /usr/bin /licenses /data /home/minio && \
+    chown -R 10001:10001 /data /home/minio
 
 # Copy CA certificates from builder
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
@@ -65,7 +89,13 @@ COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
 # Make binaries executable
 RUN chmod +x /usr/bin/minio /usr/bin/docker-entrypoint.sh
 
+# Switch to non-root user
+USER 10001:10001
+
+# Use non-root port (>1024) or configure with capability
 EXPOSE 9000
+
+# Use named volume
 VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]

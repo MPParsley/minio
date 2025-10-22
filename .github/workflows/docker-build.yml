@@ -34,6 +34,8 @@ concurrency:
 permissions:
   contents: read
   packages: write
+  attestations: write
+  id-token: write
 
 jobs:
   docker:
@@ -58,61 +60,71 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
+      - name: Extract RELEASE version for build arg
+        id: release
         run: |
-          # Get the release tag or use 'dev'
+          # Get the release tag for RELEASE build arg
           if [[ "${{ github.ref }}" == refs/tags/RELEASE.* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-            RELEASE="${VERSION}"
-            echo "version=${VERSION}" >> $GITHUB_OUTPUT
-            echo "release=${RELEASE}" >> $GITHUB_OUTPUT
-            echo "is_release=true" >> $GITHUB_OUTPUT
+            RELEASE="${GITHUB_REF#refs/tags/}"
           else
-            # For non-release builds, use git describe or commit sha
-            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev-${GITHUB_SHA::8}")
-            # Try to find the latest release tag for RELEASE arg
+            # Try to find the latest release tag
             RELEASE=$(git describe --tags --abbrev=0 2>/dev/null || echo "RELEASE.2024-01-01T00-00-00Z")
-            echo "version=${VERSION}" >> $GITHUB_OUTPUT
-            echo "release=${RELEASE}" >> $GITHUB_OUTPUT
-            echo "is_release=false" >> $GITHUB_OUTPUT
           fi
+          echo "version=${RELEASE}" >> $GITHUB_OUTPUT
 
-      - name: Generate Docker tags
-        id: docker-tags
-        run: |
-          REPO_OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          REPO_NAME_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=RELEASE.(.*),group=1
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix={{branch}}-
+          labels: |
+            org.opencontainers.image.title=MinIO
+            org.opencontainers.image.description=High Performance Object Storage compatible with Amazon S3 API
+            org.opencontainers.image.vendor=MinIO Inc (Community Build)
+            org.opencontainers.image.licenses=AGPL-3.0
 
-          TAGS="ghcr.io/${REPO_OWNER_LC}/${REPO_NAME_LC}:${{ steps.meta.outputs.version }}"
-
-          # Add 'latest' tag for release builds or main/master branch
-          if [[ "${{ steps.meta.outputs.is_release }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]] || [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            TAGS="${TAGS},ghcr.io/${REPO_OWNER_LC}/${REPO_NAME_LC}:latest"
-          fi
-
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-
-      - name: Build and push Docker image (from source)
+      - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.build
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' && (github.event.inputs.push_image != 'false') }}
-          tags: ${{ steps.docker-tags.outputs.tags }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           build-args: |
-            RELEASE=${{ steps.meta.outputs.release }}
+            RELEASE=${{ steps.release.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          labels: |
-            org.opencontainers.image.title=MinIO
-            org.opencontainers.image.description=High Performance Object Storage compatible with Amazon S3 API
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
-            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
-            org.opencontainers.image.licenses=AGPL-3.0
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,name=target,annotation-index.org.opencontainers.image.description=MinIO Object Storage
 
-      - name: Image digest
-        run: echo "Image built and pushed successfully!"
+      - name: Generate artifact attestation
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Output image details
+        run: |
+          echo "## Docker Image Build Complete! 🐳" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`ghcr.io/${{ github.repository }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
