@@ -1,0 +1,118 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'RELEASE.*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Push image to registry'
+        required: false
+        default: 'true'
+        type: boolean
+  workflow_run:
+    workflows: ["Sync Fork with Upstream"]
+    types:
+      - completed
+    branches:
+      - master
+      - main
+
+# Prevent concurrent builds
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    # Only run if workflow_run was successful or if not triggered by workflow_run
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          # Get the release tag or use 'dev'
+          if [[ "${{ github.ref }}" == refs/tags/RELEASE.* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            RELEASE="${VERSION}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "release=${RELEASE}" >> $GITHUB_OUTPUT
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            # For non-release builds, use git describe or commit sha
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev-${GITHUB_SHA::8}")
+            # Try to find the latest release tag for RELEASE arg
+            RELEASE=$(git describe --tags --abbrev=0 2>/dev/null || echo "RELEASE.2024-01-01T00-00-00Z")
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "release=${RELEASE}" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Docker tags
+        id: docker-tags
+        run: |
+          REPO_OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          TAGS="ghcr.io/${REPO_OWNER_LC}/${REPO_NAME_LC}:${{ steps.meta.outputs.version }}"
+
+          # Add 'latest' tag for release builds or main/master branch
+          if [[ "${{ steps.meta.outputs.is_release }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]] || [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAGS="${TAGS},ghcr.io/${REPO_OWNER_LC}/${REPO_NAME_LC}:latest"
+          fi
+
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image (from source)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.build
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' && (github.event.inputs.push_image != 'false') }}
+          tags: ${{ steps.docker-tags.outputs.tags }}
+          build-args: |
+            RELEASE=${{ steps.meta.outputs.release }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.title=MinIO
+            org.opencontainers.image.description=High Performance Object Storage compatible with Amazon S3 API
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            org.opencontainers.image.licenses=AGPL-3.0
+
+      - name: Image digest
+        run: echo "Image built and pushed successfully!"
