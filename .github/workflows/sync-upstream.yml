@@ -1,0 +1,56 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    # Run every day at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # Allow manual triggering
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/minio/minio.git || true
+          git remote -v
+
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream master
+          git fetch upstream --tags
+
+      - name: Sync master branch
+        run: |
+          git checkout master || git checkout -b master upstream/master
+          git merge upstream/master --ff-only || {
+            echo "Fast-forward merge not possible. Manual intervention required."
+            exit 1
+          }
+
+      - name: Push changes
+        run: |
+          git push origin master
+          git push origin --tags
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync complete
+        run: |
+          echo "Fork successfully synced with upstream minio/minio"
+          echo "Latest commit: $(git log -1 --oneline)"
